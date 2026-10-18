@@ -60,7 +60,7 @@ class DouyinChat:
                 LOGGER.info("已匹配目标搜索结果，点击对应的发消息按钮")
                 # Normal click waits for actionability; force=True can bypass an
                 # overlay or click a stale control without opening the chat.
-                diagnostic = _OpenDiagnostics(self.page)
+                diagnostic = _BusinessDiagnostics(self.page)
                 diagnostic.start()
                 try:
                     await diagnostic.arm(result)
@@ -73,6 +73,7 @@ class DouyinChat:
                     await diagnostic.snapshot("open_failed")
                     raise
                 finally:
+                    await diagnostic.drain()
                     diagnostic.report_network()
                     await diagnostic.stop()
             if asyncio.get_running_loop().time() >= deadline:
@@ -513,3 +514,218 @@ class _OpenDiagnostics:
             await self.page.evaluate(_DIAG_STOP)
         except Exception:
             pass
+
+
+
+def _result_hint(value) -> str:
+    # Only fixed categories leave the process; never echo arbitrary server text.
+    if not isinstance(value, str):
+        return 'absent'
+    upper = value.strip().upper()
+    if upper == 'OK':
+        return 'OK'
+    for label in (
+        'INVALID_REQUEST', 'INVALID_PARAM', 'UNAUTHORIZED', 'AUTH_FAILED',
+        'TOKEN_EXPIRED', 'TOKEN_INVALID', 'SESSION_EXPIRED', 'FORBIDDEN',
+        'KICK', 'NOT_LOGIN', 'NOT_AUTHORIZED', 'TOO_MANY_REQUESTS',
+    ):
+        if re.search(r'(?<![A-Z0-9_])' + label + r'(?![A-Z0-9_])', upper):
+            return label
+    for label, terms in (
+        ('SESSION_LENGTH', ('SESSION LENGTH',)),
+        ('VERIFICATION', ('CAPTCHA', '安全验证', '验证身份')),
+        ('AUTH', ('UNAUTHENTICATED', '登录失效', '未登录', 'TOKEN EXPIRED')),
+        ('RATE_LIMIT', ('RATE LIMIT', '操作频繁', '请求频繁')),
+    ):
+        if any(term in upper for term in terms):
+            return label
+    return 'other_text'
+
+
+def _safe_json_statuses(data) -> dict:
+    output = {}
+    if not isinstance(data, dict):
+        return output
+    containers = [('root', data)]
+    for key in ('data', 'base_resp', 'BaseResp', 'extra'):
+        if isinstance(data.get(key), dict):
+            containers.append((key, data[key]))
+    for prefix, container in containers:
+        for key in ('status_code', 'error_code', 'code', 'err_no', 'retcode', 'StatusCode'):
+            value = container.get(key)
+            if isinstance(value, str) and re.fullmatch(r'-?\d{1,9}', value):
+                value = int(value)
+            if isinstance(value, int) and not isinstance(value, bool) and abs(value) <= 999_999_999:
+                output[prefix + '.' + key] = value
+        for key in ('message', 'msg', 'error_desc', 'status_msg', 'description', 'StatusMessage'):
+            if key in container:
+                output[prefix + '.' + key] = _result_hint(container[key])
+    return output
+
+
+def _read_varint(data: bytes, offset: int) -> tuple[int, int]:
+    value = 0
+    for shift in range(0, 70, 7):
+        if offset >= len(data):
+            raise ValueError('truncated varint')
+        byte = data[offset]
+        offset += 1
+        value |= (byte & 127) << shift
+        if not byte & 128:
+            return value, offset
+    raise ValueError('oversized varint')
+
+
+def _im_result_summary(data: bytes) -> dict:
+    if len(data) > 2_000_000:
+        return {'format': 'too_large'}
+    stripped = data.lstrip()
+    if not stripped:
+        return {'format': 'empty'}
+    if stripped.startswith((b'{', b'[')):
+        try:
+            return {'format': 'json', **_safe_json_statuses(json.loads(data))}
+        except Exception:
+            return {'format': 'json_unreadable'}
+    if len(data) <= 1024 and re.fullmatch(rb'[\x20-\x7e\r\n\t]+', data):
+        hint = _result_hint(data.decode('ascii'))
+        return {'format': 'text', 'message_hint': hint}
+
+    # Read only the outer response envelope: field 1 cmd, field 3 error_desc,
+    # field 4 message. Skip field 6 (conversations/messages/tickets) entirely.
+    # Schema reference: cv-cat/DouYin_Spider static/Response.proto.
+    output = {'format': 'protobuf_envelope', 'body_present': False}
+    offset = 0
+    fields = 0
+    try:
+        while offset < len(data):
+            fields += 1
+            if fields > 128:
+                raise ValueError('too many envelope fields')
+            key, offset = _read_varint(data, offset)
+            number, wire = key >> 3, key & 7
+            if not number:
+                raise ValueError('invalid field number')
+            if wire == 0:
+                value, offset = _read_varint(data, offset)
+                if number == 1 and value <= 999_999:
+                    output['cmd'] = value
+            elif wire == 1:
+                offset += 8
+            elif wire == 2:
+                size, offset = _read_varint(data, offset)
+                end = offset + size
+                if end > len(data):
+                    raise ValueError('truncated field')
+                if number in (3, 4) and size <= 1024:
+                    output['error_hint' if number == 3 else 'message_hint'] = _result_hint(
+                        data[offset:end].decode('utf-8', errors='replace')
+                    )
+                if number == 6:
+                    output['body_present'] = bool(size)
+                offset = end
+            elif wire == 5:
+                offset += 4
+            else:
+                raise ValueError('unsupported wire type')
+            if offset > len(data):
+                raise ValueError('truncated fixed field')
+    except Exception:
+        return {'format': 'not_decoded'}
+    return output
+
+
+class _BusinessDiagnostics(_OpenDiagnostics):
+    def __init__(self, page: Page) -> None:
+        super().__init__(page)
+        self.tasks = []
+        self.im_replies = 0
+        self.navigation_count = 0
+
+    def start(self) -> None:
+        super().start()
+        # Extend the response observer, keeping the original request counters.
+        for event, callback in list(self.listeners):
+            if event == 'response':
+                try:
+                    self.page.remove_listener(event, callback)
+                    self.listeners.remove((event, callback))
+                except Exception:
+                    pass
+        for event, callback in (
+            ('response', self._on_response),
+            ('framenavigated', self._on_navigated),
+        ):
+            try:
+                self.page.on(event, callback)
+                self.listeners.append((event, callback))
+            except Exception:
+                pass
+
+    def _on_navigated(self, frame) -> None:
+        self.navigation_count += 1
+
+    def _on_response(self, response) -> None:
+        self._record('response', response.request, response.status)
+        try:
+            host = urlsplit(response.url).hostname
+            if host not in ('imapi.douyin.com', 'imapi.snssdk.com') or len(self.tasks) >= 6:
+                return
+            self.tasks.append(asyncio.create_task(self._inspect_im(response)))
+        except Exception:
+            pass
+
+    async def _inspect_im(self, response) -> None:
+        self.im_replies += 1
+        index = self.im_replies
+        LOGGER.info('OPEN_DIAG_V3 im_reply=%d http=%d', index, response.status)
+        try:
+            length = response.headers.get('content-length', '')
+            if length.isdigit() and int(length) > 2_000_000:
+                summary = {'format': 'too_large'}
+            else:
+                summary = _im_result_summary(await response.body())
+            # Individual scalar lines remain readable when GitHub masks braces.
+            for key, value in summary.items():
+                LOGGER.info('OPEN_DIAG_V3 im_reply=%d %s=%s', index, key, value)
+        except Exception as exc:
+            LOGGER.info('OPEN_DIAG_V3 im_reply=%d unavailable=%s', index, type(exc).__name__)
+
+    async def snapshot(self, stage: str) -> None:
+        try:
+            frames = self.page.frames[:6]
+        except Exception as exc:
+            LOGGER.info('OPEN_DIAG_V3 stage=%s unavailable=%s', stage, type(exc).__name__)
+            return
+        for index, frame in enumerate(frames):
+            try:
+                data = await frame.evaluate(_DIAG_SNAPSHOT)
+                LOGGER.info(
+                    'OPEN_DIAG_V3 stage=%s frame=%d ready=%s headers=%s editors=%s visible_editors=%s',
+                    stage, index, data.get('ready_state'), data.get('visible_headers'),
+                    data.get('editor_count'), data.get('visible_editors'),
+                )
+                LOGGER.info('OPEN_DIAG_V3 stage=%s frame=%d captured_events=%d',
+                            stage, index, len(data.get('click_events', [])))
+                if index:
+                    frame_path = urlsplit(frame.url).path.lower()
+                    LOGGER.info('OPEN_DIAG_V3 frame=%d verification_component=%s', index,
+                                any(word in frame_path for word in ('captcha', 'verify', 'verification')))
+            except Exception as exc:
+                LOGGER.info('OPEN_DIAG_V3 stage=%s frame=%d unavailable=%s', stage, index, type(exc).__name__)
+
+    async def drain(self) -> None:
+        pending = [task for task in self.tasks if not task.done()]
+        if pending:
+            _, unfinished = await asyncio.wait(pending, timeout=3)
+            for task in unfinished:
+                task.cancel()
+            if unfinished:
+                await asyncio.gather(*unfinished, return_exceptions=True)
+
+    def report_network(self) -> None:
+        LOGGER.info('OPEN_DIAG_V3 summary im_replies=%d navigations=%d page_errors=%d',
+                    self.im_replies, self.navigation_count, self.page_errors)
+        for (kind, host, category, status), count in self.network.items():
+            LOGGER.info('OPEN_DIAG_V3 network kind=%s host=%s category=%s http=%d count=%d',
+                        kind, host, category, status, count)
