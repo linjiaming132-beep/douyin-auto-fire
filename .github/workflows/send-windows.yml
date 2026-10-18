@@ -1,0 +1,82 @@
+{
+  "name": "Send Douyin Messages on Windows",
+  "on": {
+    "workflow_dispatch": {
+      "inputs": {
+        "dry_run": {
+          "description": "Only check login and recipient without sending",
+          "type": "boolean",
+          "default": true
+        }
+      }
+    },
+    "schedule": [
+      {
+        "cron": "17 20 * * *",
+        "timezone": "Asia/Shanghai"
+      }
+    ]
+  },
+  "permissions": {
+    "contents": "read"
+  },
+  "concurrency": {
+    "group": "douyin-daily-sender",
+    "cancel-in-progress": false
+  },
+  "defaults": {
+    "run": {
+      "shell": "pwsh"
+    }
+  },
+  "jobs": {
+    "send": {
+      "runs-on": "windows-latest",
+      "timeout-minutes": 15,
+      "env": {
+        "DOUYIN_COOKIE": "${{ secrets.DOUYIN_COOKIE }}",
+        "DOUYIN_CONFIG": "${{ secrets.DOUYIN_CONFIG }}",
+        "HEADLESS": "false",
+        "TRACE": "false",
+        "PYTHONUTF8": "1",
+        "PYTHONIOENCODING": "utf-8"
+      },
+      "steps": [
+        {
+          "uses": "actions/checkout@v6"
+        },
+        {
+          "uses": "actions/setup-python@v6",
+          "with": {
+            "python-version": "3.11"
+          }
+        },
+        {
+          "name": "Verify diagnostic version",
+          "run": "python -c \"from pathlib import Path; text=Path('app/douyin.py').read_text(encoding='utf-8-sig'); assert 'OPEN_DIAG_V3' in text, 'Diagnostic file is missing on this branch'; print('WINDOWS_CHECK: diagnostic=V3 mode=dry-run')\""
+        },
+        {
+          "name": "Write protected configuration",
+          "run": "if ([string]::IsNullOrWhiteSpace($env:DOUYIN_COOKIE)) {\n  throw 'Missing repository secret DOUYIN_COOKIE'\n}\nif ([string]::IsNullOrWhiteSpace($env:DOUYIN_CONFIG)) {\n  throw 'Missing repository secret DOUYIN_CONFIG'\n}\n$taskConfigPath = Join-Path $env:GITHUB_WORKSPACE 'config.json'\n[System.IO.File]::WriteAllText($taskConfigPath, $env:DOUYIN_CONFIG, [System.Text.UTF8Encoding]::new($false))\n"
+        },
+        {
+          "name": "Install Python packages",
+          "run": "python -m pip install -r requirements.txt"
+        },
+        {
+          "name": "Install Chromium",
+          "run": "python -m playwright install chromium"
+        },
+        {
+          "name": "Run messages or check",
+          "env": {
+            "TRIGGER_KIND": "${{ github.event_name }}",
+            "DRY_RUN_REQUESTED": "${{ inputs.dry_run }}"
+          },
+          "run": "if ($env:TRIGGER_KIND -eq 'workflow_dispatch' -and $env:DRY_RUN_REQUESTED -eq 'true') {\n  python run.py --dry-run\n} else {\n  python run.py\n}\nexit $LASTEXITCODE\n"
+        }
+      ],
+      "if": "${{ github.event_name == 'workflow_dispatch' || vars.DOUYIN_WINDOWS_DAILY == 'true' }}"
+    }
+  }
+}
