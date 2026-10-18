@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 
 from playwright.async_api import Locator, Page
@@ -13,6 +14,7 @@ class PageOperationError(RuntimeError):
 
 
 RETRY_DELAY_MS = 3_000
+LOGGER = logging.getLogger("douyin_sender")
 
 
 class DouyinChat:
@@ -42,129 +44,68 @@ class DouyinChat:
 
     async def _open_target_once(self, name: str) -> None:
         search = await first_visible(self.page, SEARCH_INPUTS, self.timeout_ms)
-        await search.click()
+        await search.click(timeout=self.timeout_ms)
         await search.fill("")
         await search.fill(name)
-        await self.page.wait_for_timeout(1_500)
 
-        result = await self._search_result(name)
-        if result is None:
-            raise PageOperationError("搜索不到目标好友")
-        await result.click(force=True)
-        await self._confirm_opened(name)
+        # Search results mount asynchronously. While search is active, only the
+        # matching result's explicit send-message action may open a recipient.
+        # Cached conversation rows can remain visible without being actionable.
+        deadline = asyncio.get_running_loop().time() + self.timeout_ms / 1000
+        while True:
+            result = await self._search_result(name)
+            if result is not None:
+                LOGGER.info("已匹配目标搜索结果，点击对应的发消息按钮")
+                # Normal click waits for actionability; force=True can bypass an
+                # overlay or click a stale control without opening the chat.
+                await result.click(timeout=self.timeout_ms)
+                await self._confirm_opened(name)
+                return
+            if asyncio.get_running_loop().time() >= deadline:
+                rows = self.page.locator(_SEARCH_RESULT_ROWS)
+                visible_rows = 0
+                for index in range(await rows.count()):
+                    if await rows.nth(index).is_visible():
+                        visible_rows += 1
+                LOGGER.warning("可见搜索结果行数: %d", visible_rows)
+                raise PageOperationError(
+                    "未识别到目标好友对应的可见发消息按钮；请查看本次失败截图，核对搜索结果和名称"
+                )
+            await self.page.wait_for_timeout(300)
 
     async def _search_result(self, name: str) -> Locator | None:
-        # Search mode renders a separate SearchPanel. Its "发消息" action is the
-        # correct control; clicking the hidden conversation cache does not mount
-        # the composer.
-        #
-        # Identity must be resolved from the per-result name node, never from the
-        # collection container: `[class*="SearchPanelitem"]` also matches an outer
-        # `SearchPanelitems` wrapper, whose descendants would then contain the
-        # target name while `.first` returns another row's button. Scope to result
-        # rows and require the matched name node and its button to be visible here.
-        search_items = self.page.locator('[class*="SearchPanelitembox"], [class*="SearchPanelitem-box"], [class*="SearchPanelitem_box"]')
-        name_selectors = (
-            '[class*="SearchPanelitemtitle"]',
-            '[class*="SearchPanelitemTitle"]',
-            '[class*="SearchPanelitem_title"]',
-            '[class*="SearchPanelitem-title"]',
-            '[class*="SearchPanelitemname"]',
-            '[class*="SearchPanelitemName"]',
-            '[class*="SearchPanelitem_name"]',
-            '[class*="SearchPanelitem-name"]',
-        )
+        rows = self.page.locator(_SEARCH_RESULT_ROWS)
+        visible_rows = []
+        for index in range(await rows.count()):
+            row = rows.nth(index)
+            if await row.is_visible():
+                visible_rows.append(row)
 
-        # Two-phase priority: an exact friend name always wins over a group whose
-        # display name happens to start with it. Pass 1 scans every search row for
-        # an exact name; only if none is found does pass 2 accept a group member
-        # count suffix like "4161(7)" for target "4161". This ordering guarantees
-        # "test" never returns "test(7)" or "test1".
-        for index in range(await search_items.count()):
-            item = search_items.nth(index)
-            name_locator = await _visible_exact_text_locator(item, name_selectors, name)
-            if name_locator is None:
-                continue
-            button = item.locator('[class*="SearchPanelitemchat_btn"]').first
-            try:
-                if await button.count() and await button.is_visible():
-                    return button
-            except Exception:
-                continue
-
-        for index in range(await search_items.count()):
-            item = search_items.nth(index)
-            name_locator = await _visible_group_text_locator(item, name_selectors, name)
-            if name_locator is None:
-                continue
-            button = item.locator('[class*="SearchPanelitemchat_btn"]').first
-            try:
-                if await button.count() and await button.is_visible():
-                    return button
-            except Exception:
-                continue
-
-        # The nickname node can be hidden while its conversation row is visible.
-        # Locate and click the complete row instead of relying on text visibility.
-        row_selectors = (
-            '[data-e2e="conversation-item"]',
-            '[class*="conversationConversationItem"]',
-            '[class*="conversation-item"]',
-            '[class*="ConversationItem"]',
-        )
-        title_selectors = (
-            '[class*="conversationConversationItemtitle"]',
-            '[class*="ConversationItemtitle"]',
-            '[class*="ConversationItemTitle"]',
-            '[class*="conversation-item-title"]',
-            '[class*="conversation-item-Title"]',
-        )
-        for selector in row_selectors:
-            rows = self.page.locator(selector)
-            for index in range(await rows.count()):
-                row = rows.nth(index)
-                title_locator = await _visible_exact_text_locator(row, title_selectors, name)
-                if title_locator is None:
+        # Resolve exact names across every row before considering a group count
+        # suffix. Never use a substring or the text of the whole result list.
+        for matcher in (_visible_exact_text_locator, _visible_group_text_locator):
+            matches = []
+            matched_names = 0
+            for row in visible_rows:
+                title = await matcher(row, _SEARCH_RESULT_NAMES, name)
+                if title is None:
                     continue
-                try:
-                    if await row.is_visible():
-                        return row
-                except Exception:
-                    continue
-
-        # Second-phase group suffix over conversation rows (same priority rule).
-        for selector in row_selectors:
-            rows = self.page.locator(selector)
-            for index in range(await rows.count()):
-                row = rows.nth(index)
-                title_locator = await _visible_group_text_locator(row, title_selectors, name)
-                if title_locator is None:
-                    continue
-                try:
-                    if await row.is_visible():
-                        return row
-                except Exception:
-                    continue
-
-        # Some Douyin builds render the title itself as hidden, but keep a visible
-        # ancestor as the actionable result. Find that ancestor from the hidden title.
-        # This hidden-title fallback stays STRICT exact only: a hidden stale name
-        # node (group or plain) must never be trusted to resolve the recipient.
-        hidden_titles = self.page.locator('[class*="conversationConversationItemtitle"]')
-        for index in range(await hidden_titles.count()):
-            title = hidden_titles.nth(index)
-            if not await _text_equals(title, name):
-                continue
-            row = title.locator(
-                "xpath=ancestor::*[contains(@class, 'conversationConversationItem')][1]"
-            )
-            if await row.count() and await row.is_visible():
-                return row
-
+                matched_names += 1
+                button = await _send_action_in(row)
+                if button is not None:
+                    matches.append(button)
+            if matched_names > 1:
+                raise PageOperationError("搜索结果中存在多个同名目标，请设置唯一备注后再配置")
+            if matches:
+                return matches[0]
+            if matched_names:
+                # An exact contact is present but its action has not mounted.
+                # Wait for it instead of selecting a similarly named group.
+                return None
         return None
 
     async def message_input(self) -> Locator:
-        return await first_visible(self.page, MESSAGE_INPUTS, self.timeout_ms)
+        return await first_visible(self.page, MESSAGE_INPUTS, self.timeout_ms, editable=True)
 
     async def _confirm_opened(self, name: str, timeout_ms: int | None = None) -> None:
         timeout = timeout_ms if timeout_ms is not None else self.confirm_timeout_ms
@@ -206,7 +147,8 @@ class DouyinChat:
                 except Exception:
                     continue
                 if await _visible_exact_or_group_text_in(header, title_selectors, name):
-                    return None
+                    if await self._composer_visible():
+                        return None
 
         composer_visible = await self._composer_visible()
         return PageOperationError(
@@ -215,13 +157,56 @@ class DouyinChat:
 
     async def _composer_visible(self) -> bool:
         for selector in MESSAGE_INPUTS:
-            locator = self.page.locator(selector).first
-            try:
-                if await locator.count() and await locator.is_visible():
-                    return True
-            except Exception:
-                continue
+            nodes = self.page.locator(selector)
+            for index in range(await nodes.count()):
+                node = nodes.nth(index)
+                try:
+                    if await node.is_visible() and await node.is_editable():
+                        return True
+                except Exception:
+                    continue
         return False
+
+
+# Match individual result rows, never the plural SearchPanelitems wrapper.
+_SEARCH_RESULT_ROWS = (
+    '[class*="SearchPanelitembox" i], '
+    '[class*="SearchPanelitem-box" i], '
+    '[class*="SearchPanelitem_box" i]'
+)
+_SEARCH_RESULT_NAMES = (
+    '[class*="SearchPanelitemtitle" i]',
+    '[class*="SearchPanelitem_title" i]',
+    '[class*="SearchPanelitem-title" i]',
+    '[class*="SearchPanelitemname" i]',
+    '[class*="SearchPanelitem_name" i]',
+    '[class*="SearchPanelitem-name" i]',
+)
+
+
+async def _send_action_in(row: Locator) -> Locator | None:
+    # User-facing text survives CSS class changes. The search row containing
+    # the exact name has already been resolved before any action is considered.
+    candidates = (
+        row.get_by_role("button", name="发消息", exact=True),
+        row.get_by_text("发消息", exact=True),
+        row.locator(
+            '[class*="SearchPanelitemchat_btn" i], '
+            '[class*="SearchPanelitemchat-btn" i], '
+            '[class*="SearchPanelitemchatBtn" i]'
+        ),
+    )
+    for candidate in candidates:
+        visible = []
+        for index in range(await candidate.count()):
+            node = candidate.nth(index)
+            if await node.is_visible() and await node.is_enabled():
+                visible.append(node)
+        if len(visible) > 1:
+            raise PageOperationError("同一搜索结果中存在多个发消息按钮，无法唯一确认目标")
+        if visible:
+            return visible[0]
+    return None
 
 
 async def _visible_exact_text_in(container: Locator, selectors: tuple[str, ...], expected: str) -> bool:
@@ -322,13 +307,24 @@ async def _group_name_matches(locator: Locator, expected: str) -> bool:
         return False
 
 
-async def first_visible(page: Page, selectors: tuple[str, ...], timeout_ms: int = 15_000) -> Locator:
-    per_selector = max(500, timeout_ms // max(1, len(selectors)))
-    for selector in selectors:
-        locator = page.locator(selector).first
-        try:
-            await locator.wait_for(state="visible", timeout=per_selector)
-            return locator
-        except Exception:
-            continue
-    raise PageOperationError(f"找不到页面元素，已尝试: {', '.join(selectors)}")
+async def first_visible(
+    page: Page, selectors: tuple[str, ...], timeout_ms: int = 15_000,
+    *, editable: bool = False,
+) -> Locator:
+    # A hidden cached editor may be the first match. Check every match and use
+    # one shared deadline instead of waiting on the hidden first element.
+    deadline = asyncio.get_running_loop().time() + timeout_ms / 1000
+    while True:
+        for selector in selectors:
+            nodes = page.locator(selector)
+            for index in range(await nodes.count()):
+                node = nodes.nth(index)
+                try:
+                    if await node.is_visible():
+                        if not editable or await node.is_editable():
+                            return node
+                except Exception:
+                    continue
+        if asyncio.get_running_loop().time() >= deadline:
+            raise PageOperationError(f"找不到可用页面元素，已尝试: {', '.join(selectors)}")
+        await page.wait_for_timeout(200)
