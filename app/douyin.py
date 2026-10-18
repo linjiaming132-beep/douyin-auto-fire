@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import json
 import re
+from urllib.parse import urlsplit
 
 from playwright.async_api import Locator, Page
 
@@ -58,9 +60,21 @@ class DouyinChat:
                 LOGGER.info("已匹配目标搜索结果，点击对应的发消息按钮")
                 # Normal click waits for actionability; force=True can bypass an
                 # overlay or click a stale control without opening the chat.
-                await result.click(timeout=self.timeout_ms)
-                await self._confirm_opened(name)
-                return
+                diagnostic = _OpenDiagnostics(self.page)
+                diagnostic.start()
+                try:
+                    await diagnostic.arm(result)
+                    await diagnostic.snapshot("before_click")
+                    await result.click(timeout=self.timeout_ms)
+                    await diagnostic.snapshot("after_click")
+                    await self._confirm_opened(name)
+                    return
+                except Exception:
+                    await diagnostic.snapshot("open_failed")
+                    raise
+                finally:
+                    diagnostic.report_network()
+                    await diagnostic.stop()
             if asyncio.get_running_loop().time() >= deadline:
                 rows = self.page.locator(_SEARCH_RESULT_ROWS)
                 visible_rows = 0
@@ -328,3 +342,174 @@ async def first_visible(
         if asyncio.get_running_loop().time() >= deadline:
             raise PageOperationError(f"找不到可用页面元素，已尝试: {', '.join(selectors)}")
         await page.wait_for_timeout(200)
+
+
+
+# Diagnostic version only: observe the normal click and coarse network status.
+# Never read request headers, cookies, response bodies, DOM text, or input values.
+_DIAG_ARM = """element => {
+    const key = '__douyinOpenDiagV2';
+    const previous = window[key];
+    if (previous && previous.handler) {
+        for (const type of previous.types) document.removeEventListener(type, previous.handler, true);
+    }
+    const state = {types: ['pointerdown', 'mousedown', 'mouseup', 'click'], events: []};
+    state.handler = event => {
+        if (state.events.length < 12) state.events.push({
+            type: event.type,
+            trusted: event.isTrusted,
+            on_selected_action: event.composedPath().includes(element)
+        });
+    };
+    for (const type of state.types) document.addEventListener(type, state.handler, true);
+    window[key] = state;
+    const chain = [];
+    for (let node = element; node && chain.length < 5; node = node.parentElement) {
+        const propsKey = Object.keys(node).find(k => k.startsWith('__reactProps$'));
+        const props = propsKey ? node[propsKey] : null;
+        chain.push({
+            tag: node.tagName.toLowerCase(),
+            react_click_handler: !!(props && typeof props.onClick === 'function'),
+            react_pointer_handler: !!(props && typeof props.onPointerDown === 'function')
+        });
+    }
+    return {target_chain: chain};
+}"""
+
+_DIAG_SNAPSHOT = """() => {
+    const visible = element => {
+        const style = getComputedStyle(element);
+        return style.visibility !== 'hidden' && style.display !== 'none' &&
+            element.getClientRects().length > 0;
+    };
+    const editors = [...document.querySelectorAll('[contenteditable], textarea, [role="textbox"]')];
+    const headers = [...document.querySelectorAll('[class*="RightPanelHeader"], [class*="chatHeader"], [class*="ChatHeader"]')];
+    const state = window.__douyinOpenDiagV2;
+    return {
+        ready_state: document.readyState,
+        visible_headers: headers.filter(visible).length,
+        editor_count: editors.length,
+        visible_editors: editors.filter(visible).length,
+        editors: editors.slice(0, 8).map(element => ({
+            tag: element.tagName.toLowerCase(), visible: visible(element),
+            contenteditable: element.isContentEditable,
+            readonly: !!element.readOnly, disabled: !!element.disabled
+        })),
+        visible_dialogs: [...document.querySelectorAll('[role="dialog"]')].filter(visible).length,
+        iframe_count: document.querySelectorAll('iframe').length,
+        click_events: state ? state.events : []
+    };
+}"""
+
+_DIAG_STOP = """() => {
+    const state = window.__douyinOpenDiagV2;
+    if (state && state.handler) {
+        for (const type of state.types) document.removeEventListener(type, state.handler, true);
+    }
+    delete window.__douyinOpenDiagV2;
+}"""
+
+
+def _network_endpoint(url: str) -> tuple[str, str]:
+    # URLs often contain tokens, user IDs or message IDs. Report no full URLs.
+    try:
+        parsed = urlsplit(url)
+        host = (parsed.hostname or '').lower()
+        if not re.fullmatch(r'[a-z0-9.-]{1,128}', host):
+            host = 'other'
+        path = parsed.path.lower()
+    except Exception:
+        return 'other', 'other'
+    for category, words in (
+        ('auth', ('passport', 'login', 'auth')),
+        ('verification', ('captcha', 'verify', 'risk')),
+        ('chat', ('conversation', 'message', '/im/', '/chat')),
+    ):
+        if any(word in path for word in words):
+            return host, category
+    return host, 'other'
+
+
+class _OpenDiagnostics:
+    def __init__(self, page: Page) -> None:
+        self.page = page
+        self.network = {}
+        self.listeners = []
+        self.suppressed = 0
+        self.page_errors = 0
+
+    def _record(self, kind, request, status=0) -> None:
+        try:
+            if request.resource_type not in ('xhr', 'fetch', 'document', 'script'):
+                return
+            host, category = _network_endpoint(request.url)
+            status = status if isinstance(status, int) and not isinstance(status, bool) else 0
+            key = (kind, host, category, status)
+            if key not in self.network and len(self.network) >= 25:
+                self.suppressed += 1
+                return
+            self.network[key] = self.network.get(key, 0) + 1
+        except Exception:
+            # Diagnostics must not affect the task or print exception strings
+            # that might contain a full URL or page content.
+            pass
+
+    def start(self) -> None:
+        callbacks = (
+            ('response', lambda response: self._record('response', response.request, response.status)),
+            ('requestfailed', lambda request: self._record('requestfailed', request)),
+            ('pageerror', lambda error: self._record_pageerror()),
+        )
+        for event, callback in callbacks:
+            try:
+                self.page.on(event, callback)
+                self.listeners.append((event, callback))
+            except Exception:
+                pass
+    def _record_pageerror(self) -> None:
+        self.page_errors += 1
+
+    async def arm(self, action: Locator) -> None:
+        try:
+            data = await action.evaluate(_DIAG_ARM)
+            LOGGER.info('OPEN_DIAG_V2 action %s', json.dumps(data, ensure_ascii=False))
+        except Exception as exc:
+            LOGGER.info('OPEN_DIAG_V2 action_unavailable %s', type(exc).__name__)
+
+    async def snapshot(self, stage: str) -> None:
+        try:
+            data = await self.page.evaluate(_DIAG_SNAPSHOT)
+            LOGGER.info('OPEN_DIAG_V2 %s %s', stage, json.dumps(data, ensure_ascii=False))
+            # Editors inside frames cannot be found by page-level locators.
+            # Report only coarse counts for each frame, without frame names/URLs.
+            frames = self.page.frames
+            for index, frame in enumerate(frames[1:6], 1):
+                try:
+                    frame_data = await frame.evaluate(_DIAG_SNAPSHOT)
+                    LOGGER.info('OPEN_DIAG_V2 %s frame_%d %s', stage, index,
+                                json.dumps(frame_data, ensure_ascii=False))
+                except Exception as exc:
+                    LOGGER.info('OPEN_DIAG_V2 frame_unavailable %s', type(exc).__name__)
+        except Exception as exc:
+            LOGGER.info('OPEN_DIAG_V2 snapshot_unavailable %s', type(exc).__name__)
+
+    def report_network(self) -> None:
+        rows = [dict(kind=key[0], host=key[1], category=key[2], status=key[3], count=count)
+                for key, count in self.network.items()]
+        LOGGER.info('OPEN_DIAG_V2 network %s', json.dumps({
+            'requests': rows, 'extra_categories': self.suppressed,
+            'page_error_count': self.page_errors,
+            'scope': 'click_to_chat_only; HTTP 200 does not prove business success'
+        }, ensure_ascii=False))
+
+    async def stop(self) -> None:
+        for event, callback in self.listeners:
+            try:
+                self.page.remove_listener(event, callback)
+            except Exception:
+                pass
+        self.listeners.clear()
+        try:
+            await self.page.evaluate(_DIAG_STOP)
+        except Exception:
+            pass
