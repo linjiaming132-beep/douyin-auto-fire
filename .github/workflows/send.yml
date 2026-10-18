@@ -30,7 +30,7 @@ jobs:
       WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
       WEBHOOK_HEADERS: ${{ secrets.WEBHOOK_HEADERS }}
       WEBHOOK_TEMPLATE: ${{ secrets.WEBHOOK_TEMPLATE }}
-      HEADLESS: "true"
+      HEADLESS: "false"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -113,9 +113,9 @@ jobs:
         shell: bash
         run: |
           if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ inputs.dry_run }}" == "true" ]]; then
-            python run.py --dry-run
+            xvfb-run -a python run.py --dry-run
           else
-            python run.py
+            xvfb-run -a python run.py
           fi
       - name: Upload diagnostics
         if: failure()
