@@ -1,6 +1,13 @@
 from __future__ import annotations
 
+# Required Notice: Copyright (c) 2026 unmev
+# Derived from douyin-auto-fire; PolyForm Noncommercial License 1.0.0.
+# https://polyformproject.org/licenses/noncommercial/1.0.0
+
 import asyncio
+import json
+import logging
+import re
 import random
 import secrets
 from urllib.parse import urlsplit
@@ -40,8 +47,10 @@ async def _trigger_send(page: Page) -> None:
         except Exception:
             continue
     if button is not None:
+        _SEND_LOG.info('SEND_DIAG_V1 trigger=button_click')
         await button.click()
     else:
+        _SEND_LOG.info("SEND_DIAG_V1 trigger=enter_key")
         await page.keyboard.press("Enter")
 
 
@@ -115,7 +124,7 @@ SEND_STABLE_INTERVAL_MS = 500
 SEND_INITIAL_CLEAN_GRACE_MS = 2_000
 
 
-async def send_message(page: Page, chat: DouyinChat, message: Message, stickers: dict[str, Sticker]) -> None:
+async def _send_message_without_diagnostics(page: Page, chat: DouyinChat, message: Message, stickers: dict[str, Sticker]) -> None:
     if message.type == "random":
         await send_message(page, chat, random.choice(message.choices), stickers)
         return
@@ -153,6 +162,7 @@ async def send_text(chat: DouyinChat, content: str) -> None:
     except Exception as exc:
         raise PageOperationError("文字未能写入聊天输入框") from exc
 
+    _SEND_LOG.info('SEND_DIAG_V1 stage=editor_verified')
     before = await _mark_latest_outgoing_message(page)
     await page.wait_for_timeout(300)
     await _trigger_send(page)
@@ -448,6 +458,7 @@ async def _confirm_outgoing_message(
         # The bubble now matches our payload, but the send may still be in
         # flight or have already failed. Wait for a real terminal state rather
         # than treating a visible bubble as success (Issue #11).
+        _SEND_LOG.info('SEND_DIAG_V1 stage=bubble_matched')
         latest = page.locator(LATEST_OUTGOING_MESSAGE).first
         await _await_send_terminal_state(page, latest, label)
     except PageOperationError:
@@ -462,3 +473,376 @@ async def _confirm_outgoing_message(
             )
         except Exception:
             pass
+
+
+def _result_hint(value) -> str:
+    # Only fixed categories leave the process; never echo arbitrary server text.
+    if not isinstance(value, str):
+        return 'absent'
+    upper = value.strip().upper()
+    if upper == 'OK':
+        return 'OK'
+    for label in (
+        'INVALID_REQUEST', 'INVALID_PARAM', 'UNAUTHORIZED', 'AUTH_FAILED',
+        'TOKEN_EXPIRED', 'TOKEN_INVALID', 'SESSION_EXPIRED', 'FORBIDDEN',
+        'KICK', 'NOT_LOGIN', 'NOT_AUTHORIZED', 'TOO_MANY_REQUESTS',
+    ):
+        if re.search(r'(?<![A-Z0-9_])' + label + r'(?![A-Z0-9_])', upper):
+            return label
+    for label, terms in (
+        ('SESSION_LENGTH', ('SESSION LENGTH',)),
+        ('VERIFICATION', ('CAPTCHA', '安全验证', '验证身份')),
+        ('AUTH', ('UNAUTHENTICATED', '登录失效', '未登录', 'TOKEN EXPIRED')),
+        ('RATE_LIMIT', ('RATE LIMIT', '操作频繁', '请求频繁')),
+    ):
+        if any(term in upper for term in terms):
+            return label
+    return 'other_text'
+
+
+def _safe_json_statuses(data) -> dict:
+    output = {}
+    if not isinstance(data, dict):
+        return output
+    containers = [('root', data)]
+    for key in ('data', 'base_resp', 'BaseResp', 'extra'):
+        if isinstance(data.get(key), dict):
+            containers.append((key, data[key]))
+    for prefix, container in containers:
+        for key in ('status_code', 'error_code', 'code', 'err_no', 'retcode', 'StatusCode'):
+            value = container.get(key)
+            if isinstance(value, str) and re.fullmatch(r'-?\d{1,9}', value):
+                value = int(value)
+            if isinstance(value, int) and not isinstance(value, bool) and abs(value) <= 999_999_999:
+                output[prefix + '.' + key] = value
+        for key in ('message', 'msg', 'error_desc', 'status_msg', 'description', 'StatusMessage'):
+            if key in container:
+                output[prefix + '.' + key] = _result_hint(container[key])
+    return output
+
+
+def _read_varint(data: bytes, offset: int) -> tuple[int, int]:
+    value = 0
+    for shift in range(0, 70, 7):
+        if offset >= len(data):
+            raise ValueError('truncated varint')
+        byte = data[offset]
+        offset += 1
+        value |= (byte & 127) << shift
+        if not byte & 128:
+            return value, offset
+    raise ValueError('oversized varint')
+
+
+def _im_result_summary(data: bytes) -> dict:
+    if len(data) > 2_000_000:
+        return {'format': 'too_large'}
+    stripped = data.lstrip()
+    if not stripped:
+        return {'format': 'empty'}
+    if stripped.startswith((b'{', b'[')):
+        try:
+            return {'format': 'json', **_safe_json_statuses(json.loads(data))}
+        except Exception:
+            return {'format': 'json_unreadable'}
+    if len(data) <= 1024 and re.fullmatch(rb'[\x20-\x7e\r\n\t]+', data):
+        hint = _result_hint(data.decode('ascii'))
+        return {'format': 'text', 'message_hint': hint}
+
+    # Read only the outer response envelope: field 1 cmd, field 3 error_desc,
+    # field 4 message. Skip field 6 (conversations/messages/tickets) entirely.
+    # Schema reference: cv-cat/DouYin_Spider static/Response.proto.
+    output = {'format': 'protobuf_envelope_candidate', 'body_present': False}
+    offset = 0
+    fields = 0
+    try:
+        while offset < len(data):
+            fields += 1
+            if fields > 128:
+                raise ValueError('too many envelope fields')
+            key, offset = _read_varint(data, offset)
+            number, wire = key >> 3, key & 7
+            if not number:
+                raise ValueError('invalid field number')
+            if wire == 0:
+                value, offset = _read_varint(data, offset)
+                if number == 1 and value <= 999_999:
+                    output['cmd'] = value
+            elif wire == 1:
+                offset += 8
+            elif wire == 2:
+                size, offset = _read_varint(data, offset)
+                end = offset + size
+                if end > len(data):
+                    raise ValueError('truncated field')
+                if number in (3, 4) and size <= 1024:
+                    output['error_hint' if number == 3 else 'message_hint'] = _result_hint(
+                        data[offset:end].decode('utf-8', errors='replace')
+                    )
+                if number == 6:
+                    output['body_present'] = bool(size)
+                offset = end
+            elif wire == 5:
+                offset += 4
+            else:
+                raise ValueError('unsupported wire type')
+            if offset > len(data):
+                raise ValueError('truncated fixed field')
+    except Exception:
+        return {'format': 'not_decoded'}
+    return output
+
+
+# Passive send-stage diagnostics. No request replay or automatic retry.
+_SEND_LOG = logging.getLogger("douyin_sender")
+
+
+def _send_endpoint(url):
+    try:
+        parsed = urlsplit(url)
+        host = (parsed.hostname or "").lower()
+        path = parsed.path.lower()
+    except Exception:
+        return "ignored", "ignored"
+    if host in ("imapi.douyin.com", "imapi.snssdk.com"):
+        return "douyin_im" if host.endswith("douyin.com") else "bytedance_im", "im"
+    if host == "www.douyin.com":
+        if re.search(r"/(?:im|message|messages|conversation)(?:/|$)", path):
+            return "douyin_web", "im"
+        if any(word in path for word in ("passport", "login", "captcha", "verify")):
+            return "douyin_web", "auth"
+    if host.endswith(".snssdk.com") and host.startswith("frontier"):
+        return "bytedance_gateway", "gateway"
+    return "ignored", "ignored"
+
+
+def _send_failure_hint(value):
+    text = str(value or "").upper()
+    for label, terms in (
+        ("timeout", ("TIMED_OUT", "TIMEOUT")),
+        ("connection", ("CONNECTION", "DISCONNECTED", "NETWORK_CHANGED")),
+        ("dns", ("NAME_NOT_RESOLVED", "DNS")),
+        ("tls", ("CERT_", "SSL_")),
+        ("blocked", ("BLOCKED", "ACCESS_DENIED")),
+        ("cancelled", ("ABORTED", "CANCELED", "CANCELLED")),
+    ):
+        if any(term in text for term in terms):
+            return label
+    return "other"
+
+
+class _SendDiagnostics:
+    """Observe one send, including writing, triggering and UI confirmation.
+
+    HTTP response bodies are parsed in memory only for allowlisted IM endpoints.
+    Logs contain fixed classifications/numeric status codes, never raw bodies,
+    headers, full URLs, exception messages, friend names or message content.
+    CDP WebSocket observation reports metadata only, including unknown existing
+    connections. WebSocket payloads are never parsed or printed.
+    """
+
+    def __init__(self, page):
+        self.page = page
+        self.source = page.context
+        self.listeners = []
+        self.tasks = []
+        self.requests = {}
+        self.http_requests = self.http_responses = self.http_failures = 0
+        self.im_bodies = 0
+        self.truncated = False
+        self.cdp = None
+        self.ws_routes = {}
+        self.ws_sent = self.ws_received = self.ws_errors = 0
+        self.ws_logged = 0
+        self.closed = False
+
+    async def start(self):
+        _SEND_LOG.info("SEND_DIAG_V1 begin scope=send_stage")
+        for event, callback in (
+            ("request", self._request),
+            ("response", self._response),
+            ("requestfailed", self._failed),
+        ):
+            try:
+                self.source.on(event, callback)
+                self.listeners.append((event, callback))
+            except Exception:
+                _SEND_LOG.info("SEND_DIAG_V1 observer=http_unavailable")
+        try:
+            self.cdp = await self.page.context.new_cdp_session(self.page)
+            self.cdp.on("Network.webSocketCreated", self._ws_created)
+            self.cdp.on("Network.webSocketFrameSent", lambda event: self._ws_frame(event, True))
+            self.cdp.on("Network.webSocketFrameReceived", lambda event: self._ws_frame(event, False))
+            self.cdp.on("Network.webSocketFrameError", self._ws_error)
+            self.cdp.on("Network.webSocketHandshakeResponseReceived", self._ws_handshake)
+            await self.cdp.send("Network.enable")
+            _SEND_LOG.info("SEND_DIAG_V1 observer=websocket_metadata_enabled")
+        except Exception:
+            _SEND_LOG.info("SEND_DIAG_V1 observer=websocket_unavailable")
+
+    def _identify(self, request):
+        route = _send_endpoint(request.url)
+        if route[0] == "ignored":
+            return None
+        key = id(request)
+        if key not in self.requests:
+            if len(self.requests) >= 80:
+                self.truncated = True
+                return None
+            # Retain object to prevent Python id reuse during the observation.
+            self.requests[key] = (len(self.requests) + 1, route, request)
+        return self.requests[key][:2]
+
+    def _request(self, request):
+        if self.closed:
+            return
+        try:
+            info = self._identify(request)
+            if info is None:
+                return
+            number, (host_group, category) = info
+            method = request.method if request.method in ("GET", "POST", "PUT", "DELETE", "OPTIONS", "HEAD", "PATCH") else "other"
+            self.http_requests += 1
+            _SEND_LOG.info("SEND_DIAG_V1 request=%d group=%s category=%s method=%s", number, host_group, category, method)
+        except Exception:
+            pass
+
+    def _response(self, response):
+        if self.closed:
+            return
+        try:
+            info = self._identify(response.request)
+            if info is None:
+                return
+            number, (host_group, category) = info
+            self.http_responses += 1
+            status = response.status
+            status = status if isinstance(status, int) and 100 <= status <= 599 else 0
+            _SEND_LOG.info("SEND_DIAG_V1 response=%d group=%s category=%s http=%d", number, host_group, category, status)
+            if category == "im" and len(self.tasks) < 6:
+                self.tasks.append(asyncio.create_task(self._inspect_body(response, number, host_group)))
+        except Exception:
+            pass
+
+    async def _inspect_body(self, response, number, host_group):
+        self.im_bodies += 1
+        try:
+            length = response.headers.get("content-length", "")
+            if length.isdigit() and int(length) > 2_000_000:
+                result = {"format": "too_large"}
+            else:
+                payload = await response.body()
+                if host_group == "douyin_web" and not payload.lstrip().startswith((b"{", b"[")):
+                    result = {"format": "not_decoded"}
+                else:
+                    result = _im_result_summary(payload)
+            for key, value in result.items():
+                _SEND_LOG.info("SEND_DIAG_V1 reply=%d %s=%s", number, key, value)
+        except Exception:
+            _SEND_LOG.info("SEND_DIAG_V1 reply=%d format=unavailable", number)
+
+    def _failed(self, request):
+        if self.closed:
+            return
+        try:
+            info = self._identify(request)
+            if info is None:
+                return
+            number, (host_group, category) = info
+            self.http_failures += 1
+            _SEND_LOG.info("SEND_DIAG_V1 failed=%d group=%s category=%s reason=%s", number, host_group, category, _send_failure_hint(request.failure))
+        except Exception:
+            pass
+
+    def _ws_created(self, event):
+        if self.closed:
+            return
+        if len(self.ws_routes) < 40:
+            self.ws_routes[event.get("requestId")] = _send_endpoint(event.get("url", ""))[0]
+
+    def _ws_frame(self, event, outgoing):
+        if self.closed:
+            return
+        if outgoing:
+            self.ws_sent += 1
+        else:
+            self.ws_received += 1
+        if self.ws_logged >= 20:
+            return
+        self.ws_logged += 1
+        group = self.ws_routes.get(event.get("requestId"), "unknown_existing")
+        response = event.get("response") or {}
+        opcode = response.get("opcode")
+        opcode = opcode if opcode in (0, 1, 2, 8, 9, 10) else -1
+        # Only log wire size, not frame data. Binary CDP payloads use base64.
+        payload = response.get("payloadData", "")
+        size = len(payload.encode("utf-8")) if isinstance(payload, str) else 0
+        _SEND_LOG.info("SEND_DIAG_V1 websocket direction=%s group=%s opcode=%d wire_chars=%d", "sent" if outgoing else "received", group, opcode, size)
+
+    def _ws_error(self, event):
+        if self.closed:
+            return
+        self.ws_errors += 1
+        _SEND_LOG.info("SEND_DIAG_V1 websocket_error reason=%s", _send_failure_hint(event.get("errorMessage")))
+
+    def _ws_handshake(self, event):
+        if self.closed:
+            return
+        status = (event.get("response") or {}).get("status")
+        status = status if isinstance(status, (int, float)) and 100 <= status <= 599 else 0
+        group = self.ws_routes.get(event.get("requestId"), "unknown_existing")
+        _SEND_LOG.info("SEND_DIAG_V1 websocket_handshake group=%s http=%d", group, status)
+
+    async def finish(self, outcome):
+        try:
+            # Give terminal responses a short chance to finish after the UI result.
+            await self.page.wait_for_timeout(400)
+        except Exception:
+            pass
+        self.closed = True
+        for event, callback in self.listeners:
+            try:
+                self.source.remove_listener(event, callback)
+            except Exception:
+                pass
+        self.listeners.clear()
+        try:
+            pending = [task for task in self.tasks if not task.done()]
+            if pending:
+                _, unfinished = await asyncio.wait(pending, timeout=2)
+                for task in unfinished:
+                    task.cancel()
+                if unfinished:
+                    await asyncio.gather(*unfinished, return_exceptions=True)
+        finally:
+            if self.cdp is not None:
+                try:
+                    await self.cdp.detach()
+                except Exception:
+                    pass
+            _SEND_LOG.info("SEND_DIAG_V1 summary outcome=%s requests=%d responses=%d network_failures=%d im_bodies=%d ws_sent=%d ws_received=%d ws_errors=%d http_truncated=%s", outcome, self.http_requests, self.http_responses, self.http_failures, self.im_bodies, self.ws_sent, self.ws_received, self.ws_errors, self.truncated)
+
+
+async def send_message(page: Page, chat: DouyinChat, message: Message, stickers: dict[str, Sticker]) -> None:
+    # Resolve random choices before the wrapper to avoid duplicate observers.
+    while message.type == "random":
+        message = random.choice(message.choices)
+    diagnostic = _SendDiagnostics(page)
+    outcome = "operation_failed"
+    try:
+        await diagnostic.start()
+        await _send_message_without_diagnostics(page, chat, message, stickers)
+        outcome = "ui_confirmed"
+    except PageOperationError as exc:
+        if "页面提示可以重试" in str(exc):
+            outcome = "ui_retry_marker"
+        elif "文字未能写入" in str(exc):
+            outcome = "editor_not_written"
+        elif "状态未能确认" in str(exc):
+            outcome = "ui_state_uncertain"
+        raise
+    finally:
+        try:
+            await diagnostic.finish(outcome)
+        except Exception:
+            _SEND_LOG.info("SEND_DIAG_V1 cleanup=unavailable")
