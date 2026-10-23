@@ -1,0 +1,33 @@
+name: Verify Douyin Cloud Session
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: douyin-cloud-session-check
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: windows-2025
+    timeout-minutes: 8
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      PYTHONUTF8: '1'
+      PYTHONIOENCODING: utf-8
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - name: Install the same Playwright version as the local tool
+        run: python -m pip install -r cloud_bridge/requirements.txt
+      - name: Check restored login and exact recipient without sending
+        env:
+          DOUYIN_CLOUD_SESSION: ${{ secrets.DOUYIN_CLOUD_SESSION }}
+        run: python -X utf8 -m cloud_bridge.preflight
