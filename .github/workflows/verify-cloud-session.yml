@@ -30,4 +30,20 @@ jobs:
       - name: Check restored login and exact recipient without sending
         env:
           DOUYIN_CLOUD_SESSION: ${{ secrets.DOUYIN_CLOUD_SESSION }}
+          DOUYIN_CLOUD_SESSION_01: ${{ secrets.DOUYIN_CLOUD_SESSION_01 }}
+          DOUYIN_CLOUD_SESSION_02: ${{ secrets.DOUYIN_CLOUD_SESSION_02 }}
+          DOUYIN_CLOUD_SESSION_03: ${{ secrets.DOUYIN_CLOUD_SESSION_03 }}
+          DOUYIN_CLOUD_SESSION_04: ${{ secrets.DOUYIN_CLOUD_SESSION_04 }}
+          DOUYIN_CLOUD_SESSION_05: ${{ secrets.DOUYIN_CLOUD_SESSION_05 }}
+          DOUYIN_CLOUD_SESSION_06: ${{ secrets.DOUYIN_CLOUD_SESSION_06 }}
+          DOUYIN_CLOUD_SESSION_07: ${{ secrets.DOUYIN_CLOUD_SESSION_07 }}
+          DOUYIN_CLOUD_SESSION_08: ${{ secrets.DOUYIN_CLOUD_SESSION_08 }}
+          DOUYIN_CLOUD_SESSION_09: ${{ secrets.DOUYIN_CLOUD_SESSION_09 }}
+          DOUYIN_CLOUD_SESSION_10: ${{ secrets.DOUYIN_CLOUD_SESSION_10 }}
+          DOUYIN_CLOUD_SESSION_11: ${{ secrets.DOUYIN_CLOUD_SESSION_11 }}
+          DOUYIN_CLOUD_SESSION_12: ${{ secrets.DOUYIN_CLOUD_SESSION_12 }}
+          DOUYIN_CLOUD_SESSION_13: ${{ secrets.DOUYIN_CLOUD_SESSION_13 }}
+          DOUYIN_CLOUD_SESSION_14: ${{ secrets.DOUYIN_CLOUD_SESSION_14 }}
+          DOUYIN_CLOUD_SESSION_15: ${{ secrets.DOUYIN_CLOUD_SESSION_15 }}
+          DOUYIN_CLOUD_SESSION_16: ${{ secrets.DOUYIN_CLOUD_SESSION_16 }}
         run: python -X utf8 -m cloud_bridge.preflight
