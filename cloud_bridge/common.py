@@ -3,19 +3,45 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import binascii
 import gzip
+import hashlib
+import hmac
 import io
 import json
 import logging
+import re
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 from urllib.parse import urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
 BUNDLE_VERSION = 1
 MAX_SECRET_BYTES = 47_000
-MAX_BUNDLE_BYTES = 8 * 1024 * 1024
+MAX_BUNDLE_BYTES = 32 * 1024 * 1024
+PART_BYTES = 24_000
+MAX_PARTS = 16
+MAX_ENCODED_BYTES = PART_BYTES * MAX_PARTS
+PARTS_FORMAT = "douyin-session-parts-v1"
+MAIN_SECRET = "DOUYIN_CLOUD_SESSION"
+TRANSPORT_CODES = frozenset({
+    "missing_session", "invalid_manifest", "missing_part", "unexpected_part",
+    "invalid_part", "length_mismatch", "checksum_mismatch", "invalid_base64",
+    "invalid_gzip", "invalid_json", "invalid_bundle", "bundle_too_large",
+    "encoded_too_large", "single_secret_too_large",
+})
 CHAT_URL = "https://www.douyin.com/chat"
+
+
+class SessionTransportError(ValueError):
+    """Only a fixed code and bounded non-sensitive counters may escape."""
+
+    def __init__(self, code, *, parts_expected=0, parts_present=0):
+        self.code = code if isinstance(code, str) and code in TRANSPORT_CODES else "invalid_manifest"
+        self.parts_expected = parts_expected if type(parts_expected) is int and 0 <= parts_expected <= MAX_PARTS else 0
+        self.parts_present = parts_present if type(parts_present) is int and 0 <= parts_present <= MAX_PARTS else 0
+        super().__init__(self.code)
 
 
 def validate_bundle(bundle):
@@ -41,30 +67,146 @@ def validate_bundle(bundle):
     return bundle
 
 
-def pack_secret(bundle):
-    validate_bundle(bundle)
-    raw = json.dumps(bundle, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode("utf-8")
+def _encode_bundle(bundle):
+    try:
+        validate_bundle(bundle)
+        raw = json.dumps(bundle, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode("utf-8")
+    except Exception:
+        raise SessionTransportError("invalid_bundle") from None
     if len(raw) > MAX_BUNDLE_BYTES:
-        raise ValueError("Session is too large")
-    encoded = base64.b64encode(gzip.compress(raw, mtime=0)).decode("ascii")
+        raise SessionTransportError("bundle_too_large")
+    return base64.b64encode(gzip.compress(raw, mtime=0)).decode("ascii")
+
+
+def pack_secret(bundle):
+    encoded = _encode_bundle(bundle)
     if len(encoded) > MAX_SECRET_BYTES:
-        raise ValueError("Session exceeds one GitHub secret; nothing was exported")
+        raise SessionTransportError("single_secret_too_large")
     return encoded
 
 
-def unpack_secret(value):
-    if not isinstance(value, str) or not value or len(value) > MAX_SECRET_BYTES:
-        raise ValueError("Missing or oversized session secret")
+def _invalid_constant(_value):
+    raise ValueError()
+
+
+def _decode_bundle(value):
     try:
         compressed = base64.b64decode(value, validate=True)
+    except (binascii.Error, ValueError, TypeError):
+        raise SessionTransportError("invalid_base64") from None
+    try:
         with gzip.GzipFile(fileobj=io.BytesIO(compressed)) as stream:
             raw = stream.read(MAX_BUNDLE_BYTES + 1)
-        if len(raw) > MAX_BUNDLE_BYTES:
-            raise ValueError()
-        bundle = json.loads(raw)
+    except Exception:
+        raise SessionTransportError("invalid_gzip") from None
+    if len(raw) > MAX_BUNDLE_BYTES:
+        raise SessionTransportError("bundle_too_large")
+    try:
+        bundle = json.loads(raw, parse_constant=_invalid_constant)
+    except Exception:
+        raise SessionTransportError("invalid_json") from None
+    try:
         return validate_bundle(bundle)
     except Exception:
-        raise ValueError("Cannot decode session secret") from None
+        raise SessionTransportError("invalid_bundle") from None
+
+
+def unpack_secret(value):
+    if not isinstance(value, str) or not value:
+        raise SessionTransportError("missing_session")
+    if len(value) > MAX_SECRET_BYTES:
+        raise SessionTransportError("single_secret_too_large")
+    return _decode_bundle(value)
+
+
+def pack_parts(bundle):
+    encoded = _encode_bundle(bundle)
+    if len(encoded) > MAX_ENCODED_BYTES:
+        raise SessionTransportError("encoded_too_large")
+    parts = [encoded[index:index + PART_BYTES] for index in range(0, len(encoded), PART_BYTES)]
+    manifest = {"format": PARTS_FORMAT, "count": len(parts), "length": len(encoded),
+                "sha256": hashlib.sha256(encoded.encode("ascii")).hexdigest()}
+    values = {MAIN_SECRET: json.dumps(manifest, separators=(",", ":"))}
+    values.update({f"{MAIN_SECRET}_{index:02d}": part for index, part in enumerate(parts, 1)})
+    return values
+
+
+def parts_info(secrets):
+    """Return only safe counts, never any part content or encoded length."""
+    if not isinstance(secrets, Mapping):
+        return 0, 0
+    expected = 0
+    main = secrets.get(MAIN_SECRET)
+    if isinstance(main, str) and len(main) <= MAX_SECRET_BYTES:
+        try:
+            manifest = json.loads(main)
+            count = manifest.get("count") if isinstance(manifest, dict) else None
+            if (isinstance(manifest, dict) and manifest.get("format") == PARTS_FORMAT
+                    and type(count) is int and 1 <= count <= MAX_PARTS):
+                expected = count
+        except Exception:
+            pass
+    present = sum(isinstance(secrets.get(f"{MAIN_SECRET}_{index:02d}"), str)
+                  and bool(secrets[f"{MAIN_SECRET}_{index:02d}"])
+                  for index in range(1, (expected or MAX_PARTS) + 1))
+    return expected, present
+
+
+def unpack_parts(secrets):
+    if not isinstance(secrets, Mapping):
+        raise SessionTransportError("invalid_manifest")
+    expected, present = parts_info(secrets)
+
+    def fail(code):
+        raise SessionTransportError(code, parts_expected=expected, parts_present=present)
+
+    main = secrets.get(MAIN_SECRET)
+    if not isinstance(main, str) or not main:
+        fail("missing_session")
+    # A manifest is tiny; bound it before parsing potentially untrusted JSON.
+    if len(main) > MAX_SECRET_BYTES:
+        fail("invalid_manifest" if main.lstrip().startswith(("{", "[")) else "single_secret_too_large")
+    try:
+        manifest = json.loads(main)
+    except Exception:
+        if main.lstrip().startswith(("{", "[")):
+            fail("invalid_manifest")
+        if present:
+            fail("unexpected_part")
+        try:
+            return unpack_secret(main)
+        except SessionTransportError as exc:
+            fail(exc.code)
+    if (not isinstance(manifest, dict)
+            or set(manifest) != {"format", "count", "length", "sha256"}
+            or manifest.get("format") != PARTS_FORMAT):
+        fail("invalid_manifest")
+    count, length, checksum = manifest["count"], manifest["length"], manifest["sha256"]
+    if (type(count) is not int or not 1 <= count <= MAX_PARTS
+            or type(length) is not int or not 1 <= length <= MAX_ENCODED_BYTES
+            or not (count - 1) * PART_BYTES < length <= count * PART_BYTES
+            or not isinstance(checksum, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", checksum)):
+        fail("invalid_manifest")
+    selected = []
+    for index in range(1, count + 1):
+        value = secrets.get(f"{MAIN_SECRET}_{index:02d}")
+        if value is None or value == "":
+            fail("missing_part")
+        if not isinstance(value, str) or not value.isascii() or len(value) > PART_BYTES:
+            fail("invalid_part")
+        selected.append(value)
+    # Extra old parts outside this manifest are deliberately ignored: a newer,
+    # smaller snapshot must not require deleting all surplus GitHub Secrets.
+    encoded = "".join(selected)
+    if len(encoded) != length:
+        fail("length_mismatch")
+    actual = hashlib.sha256(encoded.encode("ascii")).hexdigest()
+    if not hmac.compare_digest(actual, checksum.lower()):
+        fail("checksum_mismatch")
+    try:
+        return _decode_bundle(encoded)
+    except SessionTransportError as exc:
+        fail(exc.code)
 
 
 def session_script(bundle):

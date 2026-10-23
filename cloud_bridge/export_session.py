@@ -17,6 +17,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from cloud_bridge import common
 
 EXPORT_NAME = "DOUYIN_CLOUD_SESSION.txt"
+PART_NAMES = tuple(f"DOUYIN_CLOUD_SESSION_{index:02d}" for index in range(1, 17))
 SESSION_SNAPSHOT = """() => {
   if (location.protocol !== 'http:' && location.protocol !== 'https:') return null;
   if (sessionStorage.length > 4096) throw new Error('storage_limit');
@@ -147,21 +148,33 @@ def _write_secret(output, packed):
             temporary.unlink(missing_ok=True)
 
 
+def _clear_exports(folder):
+    # Exact owned files only; preserve all unrelated notes and browser data.
+    for name in ("DOUYIN_CLOUD_SESSION",) + PART_NAMES:
+        (folder / (name + ".txt")).unlink(missing_ok=True)
+
+
+def _write_parts(folder, secrets):
+    allowed = {"DOUYIN_CLOUD_SESSION", *PART_NAMES}
+    if not isinstance(secrets, dict) or "DOUYIN_CLOUD_SESSION" not in secrets or not set(secrets) <= allowed:
+        raise ExportFailure("export_format")
+    for name, value in secrets.items():
+        if not isinstance(value, str) or not value:
+            raise ExportFailure("export_format")
+    # The manifest is the final commit marker; never leave an old manifest
+    # pointing to a partially updated set of files.
+    for name in PART_NAMES:
+        if name in secrets:
+            _write_secret(folder / (name + ".txt"), secrets[name])
+    _write_secret(folder / EXPORT_NAME, secrets["DOUYIN_CLOUD_SESSION"])
+
+
 async def export_session(root=PROJECT_ROOT, *, playwright_factory=None, local_module=None):
     """Return the secret's path only after the local replay passes and closes."""
     root = Path(root)
     output = root / "data" / "cloud-export" / EXPORT_NAME
     resources = {}
-    # Remove only this tool's exact previous export, even if validation fails.
     try:
-        output.unlink(missing_ok=True)
-    except OSError:
-        raise ExportFailure("output_cleanup") from None
-    try:
-        friend = read_friend(root)
-        profile = root / "data" / "edge-profile"
-        if not profile.is_dir():
-            raise ExportFailure("profile_missing")
         if local_module is None:
             if str(root) not in sys.path:
                 sys.path.insert(0, str(root))
@@ -176,6 +189,14 @@ async def export_session(root=PROJECT_ROOT, *, playwright_factory=None, local_mo
             raise ExportFailure("profile_busy") from None
         try:
             try:
+                _clear_exports(output.parent)
+            except OSError:
+                raise ExportFailure("output_cleanup") from None
+            friend = read_friend(root)
+            profile = root / "data" / "edge-profile"
+            if not profile.is_dir():
+                raise ExportFailure("profile_missing")
+            try:
                 bundle = await asyncio.wait_for(
                     _collect_and_replay(resources, friend, profile, playwright_factory),
                     timeout=180,
@@ -188,27 +209,33 @@ async def export_session(root=PROJECT_ROOT, *, playwright_factory=None, local_mo
             if not closed:
                 raise ExportFailure("close")
             try:
-                packed = common.pack_secret(bundle)
-            except ValueError:
-                raise ExportFailure("export_size") from None
-            _write_secret(output, packed)
+                secrets = common.pack_parts(bundle)
+            except ValueError as exc:
+                size_codes = {"bundle_too_large", "encoded_too_large", "single_secret_too_large"}
+                raise ExportFailure("export_size" if getattr(exc, "code", "") in size_codes else "export_format") from None
+            _write_parts(output.parent, secrets)
+        except BaseException:
+            _clear_exports(output.parent)
+            raise
         finally:
             lock.__exit__(None, None, None)
         return output
     except BaseException:
-        output.unlink(missing_ok=True)
+        # A second export that fails to acquire the shared lock must not
+        # remove the files being produced by the active export.
         raise
 
 
 MESSAGES = {
     "settings": "好友设置不完整，请先在原面板保存准确好友。",
     "profile_missing": "未找到原专用浏览器数据，请将本工具放进原成功目录。",
-    "profile_busy": "原验证工具或发送任务正在使用浏览器，请正常关闭后再试。",
+    "profile_busy": "原验证工具或发送任务正在使用浏览器，请正常关闭后再试；本次未更新导出。",
     "original_probe": "原专用浏览器检查未通过，请先在电脑完成登录、验证或好友定位。",
     "session_storage": "网页会话状态未能安全读取，本次未生成导出文件。",
     "session_conflict": "同一网站的多个页面会话不一致，请正常关闭多余页面后重试。",
     "replay_probe": "全新浏览器恢复检查未通过，此次登录状态暂不能用于云端验证。",
-    "export_size": "登录状态超过单个 Secret 的容量限制，本次未生成导出文件。",
+    "export_size": "登录状态超过本版支持的分片总容量，本次未生成导出文件，请反馈此提示。",
+    "export_format": "网页登录状态格式校验未通过，本次未生成导出文件，请反馈此提示。",
     "close": "浏览器未能正常关闭，本次未生成导出文件。",
     "output_cleanup": "无法移除上一次导出文件，请关闭该文件后重试。",
 }
@@ -218,6 +245,9 @@ def main():
     print("本工具只检查登录和好友，导出后再用全新浏览器验证；不会发送消息。")
     try:
         output = asyncio.run(export_session())
+        manifest = json.loads(output.read_text(encoding="ascii"))
+        if manifest.get("format") != "douyin-session-parts-v1" or type(manifest.get("count")) is not int or not 1 <= manifest["count"] <= 16:
+            raise ExportFailure("export_format")
     except ExportFailure as exc:
         print(MESSAGES.get(str(exc), "导出未完成，本次没有可用导出文件。"))
         return 1
@@ -231,8 +261,10 @@ def main():
         print("导出未完成，请检查 Edge 和原工具环境；本次未生成导出文件。")
         return 1
     print("原浏览器与全新浏览器检查均通过；这还不代表云端能够发送消息。")
-    print("用于 GitHub Secret DOUYIN_CLOUD_SESSION 的文件：" + str(output))
-    print("请保留文件在本机，不要提交到仓库或发进聊天。本工具未上传、未复制内容。")
+    print(f"已自动拆成 {manifest['count']} 份数据，另有 1 份索引，共 {manifest['count'] + 1} 个 Secret。")
+    print("导出目录：" + str(output.parent))
+    print("下一步：在原工具目录双击 复制云端Secret.cmd，按界面依次复制名称和内容。")
+    print("请保留这些文件在本机，不要提交到仓库或发进聊天。本工具未上传、未复制内容。")
     return 0
 
 
