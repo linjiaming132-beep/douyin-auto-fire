@@ -1,0 +1,2 @@
+# Match the version in the working local browser environment.
+playwright==1.64.0
