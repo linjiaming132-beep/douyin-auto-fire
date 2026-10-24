@@ -2,7 +2,7 @@ name: Daily Douyin Cloud Send
 
 on:
   schedule:
-    - cron: '25 12 * * *'
+    - cron: '0 21 * * *'
 
 permissions:
   contents: write
@@ -32,8 +32,8 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CLOUD_DAILY_ENABLED: 'true'
-          DAILY_TIME: '20:25'
-          DAILY_CRON: '25 12 * * *'
+          DAILY_TIME: '05:00'
+          DAILY_CRON: '0 21 * * *'
           TRIGGER_CRON: ${{ github.event.schedule }}
           DOUYIN_CLOUD_MESSAGE: ${{ secrets.DOUYIN_CLOUD_MESSAGE }}
           DOUYIN_CLOUD_SESSION: ${{ secrets.DOUYIN_CLOUD_SESSION }}
