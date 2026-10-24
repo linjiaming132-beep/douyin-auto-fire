@@ -242,6 +242,7 @@ MESSAGES = {
 
 
 def main():
+    print("CLOUD_EXPORT_VERSION: PARTS_V1")
     print("本工具只检查登录和好友，导出后再用全新浏览器验证；不会发送消息。")
     try:
         output = asyncio.run(export_session())
