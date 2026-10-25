@@ -234,7 +234,7 @@ async def _visible_any(page, selectors):
     return False
 
 
-async def probe(context, friend):
+async def probe(context, friend, *, on_stage=None):
     """Open exact recipient and inspect its composer; never type chat content."""
     runtime = str(Path(__file__).resolve().parent / "runtime")
     if runtime not in sys.path:
@@ -249,8 +249,12 @@ async def probe(context, friend):
               "login_text_visible": False, "verification_text_visible": False}
     try:
         page = context.pages[0] if context.pages else await context.new_page()
+        if on_stage is not None:
+            on_stage("navigation")
         await page.goto(CHAT_URL, wait_until="domcontentloaded", timeout=60_000)
         result["stage"] = "search"
+        if on_stage is not None:
+            on_stage("search")
         deadline = asyncio.get_running_loop().time() + 20
         while True:
             route = urlsplit(page.url)
@@ -264,16 +268,22 @@ async def probe(context, friend):
         if not result["search_visible"]:
             return result
         result["stage"] = "target"
+        if on_stage is not None:
+            on_stage("target")
         chat = DouyinChat(page, timeout_ms=20_000, confirm_timeout_ms=20_000)
         await chat.open_target(friend.strip(), retries=0)
         if await chat._chat_open_error(friend.strip()) is not None:
             return result
         result["target_open"] = True
         result["stage"] = "editor"
+        if on_stage is not None:
+            on_stage("editor")
         editor = await chat.message_input()
         result["editor_visible"] = await editor.is_visible() and await editor.is_editable()
         if result["editor_visible"]:
             result.update(ok=True, stage="ready")
+            if on_stage is not None:
+                on_stage("ready")
         return result
     except Exception:
         # Never serialize Playwright's errors: they can contain selectors,

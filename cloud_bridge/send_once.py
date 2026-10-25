@@ -82,19 +82,25 @@ async def ready(chat, friend):
         return "target_changed"
 
 
-async def attempt(page, chat, friend, config, ledger, run_id, kind, day, sender, *, progress=None):
+async def attempt(page, chat, friend, config, ledger, run_id, kind, day, sender, *, progress=None, on_stage=None):
     result = {"outcome": "environment_error", "send_attempted": False, "page_send_check_passed": False}
     if now().date().isoformat() != day:
         return dict(result, outcome="date_changed")
+    if on_stage is not None:
+        on_stage("verify_chat")
     blocked = await ready(chat, friend)
     if blocked:
         return dict(result, outcome=blocked)
     try:
+        if on_stage is not None:
+            on_stage("reserve")
         reserved = await asyncio.to_thread(ledger.reserve, day, friend, run_id, kind, imported_days=config["imported_days"])
     except LedgerError as exc:
         return dict(result, outcome="ledger_error", ledger_reason=exc.code)
     if not reserved:
         return dict(result, outcome="already_attempted")
+    if on_stage is not None:
+        on_stage("recheck")
     # CAS/network traffic may take time. Recheck the live target, draft, and
     # Beijing day after the durable reservation and before typing anything.
     if now().date().isoformat() != day:
@@ -103,6 +109,8 @@ async def attempt(page, chat, friend, config, ledger, run_id, kind, day, sender,
     if blocked:
         return dict(result, outcome=blocked)
     configure_metadata()
+    if on_stage is not None:
+        on_stage("send")
     result["send_attempted"] = True
     if progress is not None:
         progress["send_attempted"] = True
@@ -116,11 +124,15 @@ async def attempt(page, chat, friend, config, ledger, run_id, kind, day, sender,
         terminal = "send_retry_marker" if "页面提示可以重试" in str(exc) else "send_failed_or_uncertain"
         result["outcome"] = terminal
     try:
+        if on_stage is not None:
+            on_stage("save_result")
         recorded = await asyncio.to_thread(ledger.finish, day, friend, run_id, terminal, kind=kind)
     except LedgerError as exc:
         return dict(result, outcome="ledger_update_failed", ledger_reason=exc.code)
     if not recorded:
         return dict(result, outcome="ledger_update_failed")
+    if on_stage is not None:
+        on_stage("done")
     return result
 
 
