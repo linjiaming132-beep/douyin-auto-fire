@@ -54,11 +54,28 @@ def phase(entry, stage):
 
 def safe_timing(timing):
     result = {}
-    for key in ("started", "accepted_until", "deadline"):
+    for key in ("started", "checked", "allowed_from", "accepted_until", "deadline"):
         value = timing.get(key) if isinstance(timing, dict) else None
         if isinstance(value, datetime) and value.tzinfo is not None and value.utcoffset() is not None:
             result[key + "_bj"] = value.astimezone(core.BJ).isoformat(timespec="seconds")
     return result
+
+
+def admission_timing(checked, *, started=None):
+    timing = {"started": started if started is not None else checked, "checked": checked}
+    try:
+        clock_text = os.environ.get("DAILY_TIME", "")
+        clock = datetime.strptime(clock_text, "%H:%M")
+        if clock.strftime("%H:%M") != clock_text:
+            return timing
+        local = checked.astimezone(core.BJ)
+        due = local.replace(hour=clock.hour, minute=clock.minute, second=0, microsecond=0)
+        midnight = (due + timedelta(days=1)).replace(hour=0, minute=0)
+        timing.update(allowed_from=due,
+                      accepted_until=min(due + timedelta(seconds=send_daily.MAX_DELAY_SECONDS), midnight))
+    except (ValueError, TypeError):
+        pass
+    return timing
 
 
 def item(index, outcome="environment_error", **values):
@@ -187,7 +204,7 @@ def report(outcome, entries, *, dry_run=True, timing=None):
     labels = {"batch_finished": "名单处理已结束。", "wrong_trigger": "仅接受定时或手动触发。",
               "disabled": "每日发送未启用。", "not_confirmed": "未确认真实发送，已停止。",
               "local_pause_not_confirmed": "请先暂停本机定时，再确认已暂停。",
-              "schedule_invalid": "定时配置不一致，已停止。", "outside_window": "当前已超出当天发送窗口，已跳过。",
+              "schedule_invalid": "定时配置不一致，已停止。", "outside_window": "本次未发送：不在允许开始时段，已按设置跳过。",
               "configuration_error": "会话或名单配置无效，或名单与会话不匹配。请重新生成名单 Secret。",
               "ledger_error": "无法初始化远端发送记录，未进入发送流程。",
               "environment_error": "运行环境未完成全部任务，请查看每项结果。"}
@@ -200,9 +217,14 @@ def report(outcome, entries, *, dry_run=True, timing=None):
                    "send_failed_or_uncertain": "失败或结果不明，不重试", "timeout": "超时，不重试",
                    "environment_error": "运行未完成"}
     with Path(summary).open("a", encoding="utf-8") as stream:
-        stream.write("### 抖音多好友任务\n\n" + labels[safe_outcome] + "\n\n")
-        stream.write("模式：**" + ("只检查，不发送" if dry_run else "真实发送") + "**。编号与设置窗口中的名单顺序一致。\n\n")
-        for key, label in (("started_bj", "程序开始时间"), ("accepted_until_bj", "最晚接受新批次"), ("deadline_bj", "本批执行截止")):
+        stream.write("### 抖音多好友任务\n\n**" + labels[safe_outcome] + "**\n\n")
+        if safe_entries:
+            stream.write("模式：**" + ("只检查，不发送" if dry_run else "真实发送") + "**。编号与设置窗口中的名单顺序一致。\n\n")
+        else:
+            stream.write("原计划模式：**" + ("只检查" if dry_run else "真实发送") + "**；本次未进入好友处理流程。\n\n")
+        for key, label in (("started_bj", "程序开始时间"), ("checked_bj", "实际时间检查"),
+                           ("allowed_from_bj", "允许开始时段起点"), ("accepted_until_bj", "最晚接受新批次（不含此时刻）"),
+                           ("deadline_bj", "本批执行截止")):
             if key in timing_values:
                 stream.write(label + "（北京时间）：" + timing_values[key] + "。\n\n")
         phase_labels = {"pending": "未开始", "context": "创建浏览器页面", "restore": "恢复登录状态",
@@ -210,7 +232,12 @@ def report(outcome, entries, *, dry_run=True, timing=None):
                         "editor": "检查输入框", "ready": "页面就绪", "verify_chat": "确认当前聊天",
                         "reserve": "写入发送预留", "recheck": "发送前复查", "send": "发送消息",
                         "save_result": "保存发送结果", "done": "完成"}
-        stream.write("| 编号 | 结果 | 最后阶段 | 进入发送流程 | 页面发送检查 |\n| --- | --- | --- | --- | --- |\n")
+        if safe_entries:
+            stream.write("| 编号 | 结果 | 最后阶段 | 进入发送流程 | 页面发送检查 |\n| --- | --- | --- | --- | --- |\n")
+        else:
+            stream.write("**本次没有进入发送流程，也没有新增发送预留。**\n\n")
+            stream.write("未生成逐位好友结果，不代表好友名单为空或已被删除。\n\n")
+            stream.write("绿色勾只表示任务正常结束；本次实际结果为未发送。\n\n")
         for entry in safe_entries:
             label = item_labels.get(entry["outcome"], "任务停止")
             if entry.get("timeout_source") == "item_limit":
@@ -238,7 +265,7 @@ def main():
             day, remaining = send_daily.schedule_window(instant)
         except send_daily.ScheduleError as error:
             code = str(error)
-            report(code, [], dry_run=False)
+            report(code, [], dry_run=False, timing=admission_timing(instant))
             return 0 if code == "outside_window" else 2
         deadline = instant + timedelta(seconds=remaining)
         kind = "scheduled"
@@ -275,7 +302,7 @@ def main():
                 raise send_daily.ScheduleError("outside_window")
         except send_daily.ScheduleError as error:
             code = str(error)
-            report(code, [], dry_run=False)
+            report(code, [], dry_run=False, timing=admission_timing(accepted, started=instant))
             return 0 if code == "outside_window" else 2
         deadline = batch_deadline(accepted, len(config["targets"]))
         timing = {"started": instant, "accepted_until": accepted + timedelta(seconds=remaining), "deadline": deadline}
